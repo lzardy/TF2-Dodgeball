@@ -149,6 +149,9 @@ Handle g_hCvarRedirectBeep;
 Handle g_hCvarPreventTauntKillEnabled;
 Handle g_hCvarStealPrevention;
 Handle g_hCvarStealPreventionNumber;
+Handle g_hCvarVoteRocketClassCommandEnabled;
+Handle g_hCvarVoteClassPercentage;
+Handle g_hCvarVoteClassCooldown;
 
 // -----<<< Gameplay >>>-----
 //int g_stolen[MAXPLAYERS + 1];
@@ -260,6 +263,15 @@ int g_iDefaultBluSpawner;
 int g_observer;
 int g_op_rocket;
 
+//Voting
+bool g_bVoteClassEnabled; // check if players are allowed to vote for a rocket class change
+bool g_bCanVoteClass; // check if voting for rocket class is on cooldown
+bool g_bClassVoted[MAXPLAYERS + 1] = {false, ...}; // check which players have voted for a rocket class change
+int g_iClassVoters = 0; // maximum number of votes
+int g_iClassVotes = 0; // how many rocket class votes recieved
+int g_iClassVotesRequired; // how many rocket class votes are needed
+int g_iTimeVoted = 0;
+
 // *********************************************************************************
 // PLUGIN
 // *********************************************************************************
@@ -299,19 +311,29 @@ public void OnPluginStart()
 	g_hCvarPreventTauntKillEnabled = CreateConVar("tf_dodgeball_block_tauntkill", "0", "Block taunt kills?");
 	g_hCvarStealPrevention = CreateConVar("tf_dodgeball_steal_prevention", "0", "Enable steal prevention?");
 	g_hCvarStealPreventionNumber = CreateConVar("tf_dodgeball_sp_number", "3", "How many steals before you get slayed?");
+	g_hCvarVoteRocketClassCommandEnabled = CreateConVar("tf_dodgeball_voteclass", "1", "Should voting for rocket class be enabled or not?");
+	g_hCvarVoteClassPercentage = CreateConVar("tf_dodgeball_voteclass_percentage", "0.60", "Percentage of votes required to change rocket class.", FCVAR_NONE, true, 0.0, true, 1.0);
+	g_hCvarVoteClassCooldown = CreateConVar("tf_dodgeball_voteclass_cooldown", "30", "Seconds before another vote for rocket class can be initated.", FCVAR_NONE, true, 0.0);
 	
 	// Commands
 	RegConsoleCmd("sm_ab", Command_ToggleAirblast, USAGE);
 	RegAdminCmd("sm_tfdb", Command_DodgeballAdminMenu, ADMFLAG_GENERIC, "A menu for admins to modify things inside the plugin.");
+	
 	RegConsoleCmd("sm_currentrocket", Command_PostCurrentRocketClass, "Posts a chat message of the name of the current main rocket class.");
+	RegConsoleCmd("sm_voterocket", Command_VoteRocketClass, "Vote to change the current rocket class.");
 	
 	ServerCommand("tf_arena_use_queue 0");
 	
 	HookConVarChange(g_hMaxBouncesConVar, tf2dodgeball_hooks);
 	HookConVarChange(g_hCvarPyroVisionEnabled, tf2dodgeball_hooks);
+	HookConVarChange(g_hCvarVoteRocketClassCommandEnabled, tf2dodgeball_hooks);
+	HookConVarChange(g_hCvarVoteClassPercentage, tf2dodgeball_hooks);
+	HookConVarChange(g_hCvarVoteClassCooldown, tf2dodgeball_hooks);
 	
 	g_hRocketClassTrie = CreateTrie();
 	g_hSpawnersTrie = CreateTrie();
+	g_bVoteClassEnabled = GetConVarBool(g_hCvarVoteRocketClassCommandEnabled);
+	g_bCanVoteClass = true;
 	
 	g_hHud = CreateHudSynchronizer();
 	
@@ -333,6 +355,18 @@ public void OnConfigsExecuted()
 	}
 }
 
+/* OnMapStart()
+**
+** When the map starts, clear vote variables.
+** -------------------------------------------------------------------------- */
+
+public void OnMapStart()
+{
+	g_iClassVoters = 0;
+	g_iClassVotes = 0;
+	g_iClassVotesRequired = 0;
+}
+
 /* OnMapEnd()
 **
 ** When the map ends, disable DodgeBall.
@@ -340,6 +374,8 @@ public void OnConfigsExecuted()
 public void OnMapEnd()
 {
 	DisableDodgeBall();
+	
+	g_bVoteClassEnabled = false;
 }
 
 public Action Command_DodgeballAdminMenu(int client, int args)
@@ -392,7 +428,7 @@ public int DodgeballAdmin_Handler(Menu menu, MenuAction action, int param1, int 
 				case 2:
 				{
 					if (!g_strSavedClassName[0]) {
-						CPrintToChat(param1, "\x05No\01 main class detected, \x05aborting\01...");
+						CPrintToChat(param1, "\x05No\01 main rocket class detected, \x05aborting\01...");
 						return;
 					}
 					DrawRocketClassMenu(param1);
@@ -724,42 +760,7 @@ public int DodgeballAdminRocketClass_Handler(Menu menu, MenuAction action, int p
 			char sInfo[32];
 			menu.GetItem(param2, sInfo, sizeof(sInfo));
 			
-			int iSpawnerClassRed = g_iSpawnPointsRedClass[g_iCurrentRedSpawn];
-			char strBufferRed[256];
-			strcopy(strBufferRed, sizeof(strBufferRed), "Red");
-			
-			Format(strBufferRed, sizeof(strBufferRed), "%s%%", g_strRocketClassName[param2]);
-			SetArrayCell(g_hSpawnersChancesTable[iSpawnerClassRed], param2, 100);
-			
-			for (int iClassIndex = 0; iClassIndex < g_iRocketClassCount; iClassIndex++)
-        	{
-				if (!(iClassIndex == param2))
-        		{
-        			Format(strBufferRed, sizeof(strBufferRed), "%s%%", g_strRocketClassName[iClassIndex]);
-        			SetArrayCell(g_hSpawnersChancesTable[iSpawnerClassRed], iClassIndex, 0);
-        		}
-        	}
-			
-			int iSpawnerClassBlu = g_iSpawnPointsBluClass[g_iCurrentBluSpawn];
-			char strBufferBlue[256];
-			strcopy(strBufferBlue, sizeof(strBufferBlue), "Blue");
-			
-			Format(strBufferBlue, sizeof(strBufferBlue), "%s%%", g_strRocketClassName[param2]);
-			SetArrayCell(g_hSpawnersChancesTable[iSpawnerClassBlu], param2, 100);
-			
-			for (int iClassIndex = 0; iClassIndex < g_iRocketClassCount; iClassIndex++)
-        	{
-				if (!(iClassIndex == param2))
-        		{
-        			Format(strBufferBlue, sizeof(strBufferBlue), "%s%%", g_strRocketClassName[iClassIndex]);
-        			SetArrayCell(g_hSpawnersChancesTable[iSpawnerClassBlu], iClassIndex, 0);
-        		}
-        	}
-			
-			int iClass = GetRandomRocketClass(iSpawnerClassRed);
-			strcopy(g_strSavedClassName, sizeof(g_strSavedClassName), g_strRocketClassLongName[iClass]);
-			
-			CPrintToChatAll("\x05%N\01 changed the rocket class to \x05%s\01.", param1, g_strRocketClassLongName[iClass]);
+			SetMainRocketClass(param2, false, param1);
 		}
 		
 		case MenuAction_Cancel:
@@ -785,6 +786,62 @@ public int DodgeballAdminRocketClass_Handler(Menu menu, MenuAction action, int p
 			menu.GetItem(param2, info, sizeof(info));
 		}
 	}
+}
+
+//__   __   _          
+//\ \ / /__| |_ ___ ___
+// \ V / _ \  _/ -_|_-<
+//  \_/\___/\__\___/__/
+
+public Action Command_VoteRocketClass(int client, int args) {
+	if (!g_strSavedClassName[0])
+	{
+		g_bVoteClassEnabled = false;
+		CPrintToChat(client, "\x05[VRC]\01 No main rocket class detected, voting for rocket class \x05disabled\01.");
+		return Plugin_Handled;
+	} 
+	else g_bVoteClassEnabled = true;
+	
+	if(!g_bVoteClassEnabled) {
+		CReplyToCommand(client, "\x05[VRC]\01 Voting for rocket class is \x05not\01 enabled");
+		return Plugin_Handled;
+	}
+	
+	if(!g_bCanVoteClass) {
+		CReplyToCommand(client,"\x05[VRC]\01 You cannot vote at this time (\x05%ds\01 left).", GetConVarInt(g_hCvarVoteClassCooldown) - (GetTime() - g_iTimeVoted), GetConVarInt(g_hCvarVoteClassCooldown));
+		return Plugin_Handled;
+	}
+	
+	g_iClassVotesRequired = RoundToCeil(GetTotalClientCount() * GetConVarFloat(g_hCvarVoteClassPercentage));
+	
+	if(g_bClassVoted[client]) {
+		CReplyToCommand(client, "\x05[VRC]\01 You have \x05already\01 voted");
+		return Plugin_Handled;
+	}
+	
+	if(IsVoteInProgress()) {
+		CReplyToCommand(client, "\x05[VRC]\01 A vote is currently \x05in progress\01");
+		return Plugin_Handled;
+	}
+	
+	g_iClassVotes++;
+	g_bClassVoted[client] = true;
+	
+	CPrintToChatAll("\x05%N\01 wants to change the rocket class (\x05%d\01/\x05%d\01 votes)", client, g_iClassVotes, g_iClassVotesRequired);
+	
+	if(g_iClassVotes >= g_iClassVotesRequired) {
+		CreateTimer(2.0, Timer_StartRocketClassVote);
+		g_bCanVoteClass = false;
+		
+		g_iClassVotes = 0;
+		for(int i = 0; i < sizeof(g_bClassVoted); i++) {
+			g_bClassVoted[i] = false;
+		}
+		
+		CreateTimer(GetConVarFloat(g_hCvarVoteClassCooldown), Timer_AllowRocketClassVote);
+	}
+	
+	return Plugin_Handled;
 }
 
 /*
@@ -950,9 +1007,19 @@ public void OnClientPutInServer(int clientId)
 	}
 }
 
+public void OnClientConnected(int client)
+{
+	if (IsFakeClient(client)) return;
+	
+	g_bClassVoted[client] = false;
+	g_iClassVoters++;
+	g_iClassVotesRequired = RoundToCeil(GetTotalClientCount() * GetConVarFloat(g_hCvarVoteClassPercentage));
+}
 
 public void OnClientDisconnect(int client)
 {
+	if(IsFakeClient(client)) return;
+	
 	if (GetConVarBool(g_hCvarPreventTauntKillEnabled))
 	{
 		SDKUnhook(client, SDKHook_OnTakeDamage, TauntCheck);
@@ -962,6 +1029,19 @@ public void OnClientDisconnect(int client)
 	{
 		bStealArray[client][stoleRocket] = false;
 		bStealArray[client][rocketsStolen] = 0;
+	}
+	
+	if(g_bClassVoted[client])
+	{
+		g_iClassVotes--;
+	}
+	
+	g_iClassVoters--;
+	g_iClassVotesRequired = RoundToCeil(GetTotalClientCount() * GetConVarFloat(g_hCvarVoteClassPercentage));
+	
+	if (g_iClassVotes >= g_iClassVotesRequired && g_bVoteClassEnabled && g_iClassVoters != 0)
+	{
+		CreateTimer(2.0, Timer_StartRocketClassVote);
 	}
 }
 
@@ -1451,6 +1531,94 @@ public Action Timer_HudSpeed(Handle hTimer)
 			}
 		}
 	}
+}
+
+public Action Timer_StartRocketClassVote(Handle timer)
+{
+	if(!g_bVoteClassEnabled)
+		return;
+		
+	g_iTimeVoted = GetTime();
+	
+	CPrintToChatAll("\x05[VRC]\01 Voting for Rocket Class \x05started\01!");
+	
+	Menu menu = new Menu(Handler_RocketClassVoteMenu);
+	menu.SetTitle("Set the Rocket Class:");
+	
+	for (int currentClass = 0; currentClass < g_iRocketClassCount; currentClass++)
+	{
+		char classNumber[16];
+		IntToString(currentClass, classNumber, sizeof(classNumber));
+		if (StrEqual(g_strSavedClassName, g_strRocketClassLongName[currentClass]))
+		{
+			char currentClassName[32];
+			strcopy(currentClassName, sizeof(currentClassName), "[Current] ");
+			StrCat(currentClassName, sizeof(currentClassName), g_strSavedClassName);
+			menu.AddItem(classNumber, currentClassName);
+		}
+		else menu.AddItem(classNumber, g_strRocketClassLongName[currentClass]);
+	}
+	
+	char nochange[64];
+	Format(nochange, 64, "Don't Change");
+	char classCount[sizeof(g_iRocketClassCount)];
+	IntToString(g_iRocketClassCount + 1, classCount, sizeof(classCount));
+	menu.AddItem(classCount, nochange);
+	
+	menu.ExitButton = false;
+	menu.DisplayVoteToAll(20);
+	
+	LogMessage("[VRC] Voting for rocket class has successfully started.");
+}
+
+public int Handler_RocketClassVoteMenu(Menu menu, MenuAction action, int param1, int param2)
+{
+	switch (action)
+	{
+		case MenuAction_End:
+		{
+			delete menu;
+		}
+		case MenuAction_Select:
+		{
+			char voter[64], choice[64];
+			GetClientName(param1, voter, sizeof(voter));
+			menu.GetItem(param2, choice, sizeof(choice));
+			LogMessage("[VRC] %s Selected Rocket Class %s", voter, choice);
+		}
+		case MenuAction_VoteEnd:
+		{
+			char classNum[64];
+			char className[64];
+			int votes, totalVotes;
+			GetMenuVoteInfo(param2, votes, totalVotes);
+			
+			if (totalVotes < 1)
+			{
+				CPrintToChatAll("\x05[VRC]\01 Voting ended with \x05no Votes\01!");
+				return;
+			}
+			
+			menu.GetItem(param1, classNum, sizeof(classNum));
+			
+			strcopy(className, sizeof(className), g_strRocketClassLongName[param1]);
+			
+			if (StrContains(className, "[Current]") != -1 || StringToInt(classNum) == (g_iRocketClassCount + 1))
+			{
+				CPrintToChatAll("\x05[VRC]\01 Current Rocket Class \x05stays\01.");
+				LogMessage("[VRC] Voting for Rocket Class has ended, current class kept.");
+			}
+			else
+			{
+				LogMessage("[VRC] Voting for Rocket Class has ended, changing class to %s.", className);
+				SetMainRocketClass(param1, true);
+			}
+		}
+	}
+}
+
+public Action Timer_AllowRocketClassVote(Handle timer, Handle hndl) {
+	g_bCanVoteClass = true;
 }
 
 //	___			_		_
@@ -2587,6 +2755,20 @@ stock int CountAlivePlayers()
 	return iCount;
 }
 
+/* GetTotalClientCount()
+**
+** Retrieves the number of real players connected.
+** -------------------------------------------------------------------------- */
+stock int GetTotalClientCount() {
+	int count = 0;
+	for (int i = 1; i <= MaxClients; i++) {
+		if (IsClientInGame(i) && !IsFakeClient(i) && GetClientTeam(i) > 1) {
+			count += 1;
+		}
+	}
+	return count;
+}
+
 /* SelectTarget()
 **
 ** Determines a random target of the given team for the homing rocket.
@@ -2887,6 +3069,8 @@ public void tf2dodgeball_hooks(Handle convar, const char[] oldValue, const char[
 	}
 	if(convar == g_hMaxBouncesConVar)
 		g_config_iMaxBounces = StringToInt(newValue);
+	if(convar == g_hCvarVoteRocketClassCommandEnabled)
+		g_bVoteClassEnabled = view_as<bool>(StringToInt(newValue));
 }
 
 // Asherkins RocketBounce
@@ -3026,6 +3210,51 @@ void checkStolenRocket(int clientId, int entId)
 			PrintToChatAll("\x03%N was slain for stealing rockets.", clientId);
 		}
 	}
+}
+
+stock void SetMainRocketClass(int Index, bool isVote, int client = 0)
+{
+	int iSpawnerClassRed = g_iSpawnPointsRedClass[g_iCurrentRedSpawn];
+	char strBufferRed[256];
+	strcopy(strBufferRed, sizeof(strBufferRed), "Red");
+	
+	Format(strBufferRed, sizeof(strBufferRed), "%s%%", g_strRocketClassName[Index]);
+	SetArrayCell(g_hSpawnersChancesTable[iSpawnerClassRed], Index, 100);
+	
+	for (int iClassIndex = 0; iClassIndex < g_iRocketClassCount; iClassIndex++)
+	{
+		if (!(iClassIndex == Index))
+		{
+			Format(strBufferRed, sizeof(strBufferRed), "%s%%", g_strRocketClassName[iClassIndex]);
+			SetArrayCell(g_hSpawnersChancesTable[iSpawnerClassRed], iClassIndex, 0);
+		}
+	}
+	
+	int iSpawnerClassBlu = g_iSpawnPointsBluClass[g_iCurrentBluSpawn];
+	char strBufferBlue[256];
+	strcopy(strBufferBlue, sizeof(strBufferBlue), "Blue");
+	
+	Format(strBufferBlue, sizeof(strBufferBlue), "%s%%", g_strRocketClassName[Index]);
+	SetArrayCell(g_hSpawnersChancesTable[iSpawnerClassBlu], Index, 100);
+	
+	char strSelectionBlue[256];
+	strcopy(strSelectionBlue, sizeof(strBufferBlue), strBufferBlue);
+	
+	for (int iClassIndex = 0; iClassIndex < g_iRocketClassCount; iClassIndex++)
+	{
+		if (!(iClassIndex == Index))
+		{
+			Format(strBufferBlue, sizeof(strBufferBlue), "%s%%", g_strRocketClassName[iClassIndex]);
+			SetArrayCell(g_hSpawnersChancesTable[iSpawnerClassBlu], iClassIndex, 0);
+		}
+	}
+	
+	int iClass = GetRandomRocketClass(iSpawnerClassRed);
+	strcopy(g_strSavedClassName, sizeof(g_strSavedClassName), g_strRocketClassLongName[iClass]);
+	
+	if (isVote)
+		CPrintToChatAll("\x05[VRC]\01 Vote \x05finished\01! Rocket class changed to \x05%s\01.", g_strSavedClassName);
+	else CPrintToChatAll("\x05%N\01 changed the rocket class to \x05%s\01.", client, g_strRocketClassLongName[iClass]);
 }
 
 public Action tStealTimer(Handle hTimer, int iClientUid)
