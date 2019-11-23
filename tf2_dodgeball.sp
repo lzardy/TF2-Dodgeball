@@ -162,6 +162,11 @@ Handle g_hCvarDelayPreventionSpeedup;
 Handle g_hCvarVoteRocketClassCommandEnabled;
 Handle g_hCvarVoteClassPercentage;
 Handle g_hCvarVoteClassCooldown;
+Handle g_hCvarPredictEnabled;
+Handle g_hCvarPredictAdminEnabled;
+Handle g_hCvarPredictSize;
+Handle g_hCvarPredictTimestep;
+Handle g_hCvarPredictTime;
 
 // -----<<< Gameplay >>>-----
 //int g_stolen[MAXPLAYERS + 1];
@@ -286,6 +291,12 @@ int g_iClassVotes = 0; // how many rocket class votes recieved
 int g_iClassVotesRequired; // how many rocket class votes are needed
 int g_iTimeVoted = 0;
 
+//Prediction
+bool g_bClientCanPredict[MAXPLAYERS];
+bool g_bClientPredicting[MAXPLAYERS];
+int g_iPredictTrail;
+int g_iPredictTrailColor[4];
+
 // *********************************************************************************
 // PLUGIN
 // *********************************************************************************
@@ -332,8 +343,15 @@ public void OnPluginStart()
 	g_hCvarVoteClassPercentage = CreateConVar("tf_dodgeball_voteclass_percentage", "0.60", "Percentage of votes required to change rocket class.", FCVAR_NONE, true, 0.0, true, 1.0);
 	g_hCvarVoteClassCooldown = CreateConVar("tf_dodgeball_voteclass_cooldown", "30", "Seconds before another vote for rocket class can be initated.", FCVAR_NONE, true, 0.0);
 	
+	g_hCvarPredictEnabled = CreateConVar("tf_dodgeball_predict", "0.0", "Enable/Disable rocket prediction", FCVAR_NOTIFY | FCVAR_DONTRECORD, true, 0.0, true, 1.0);
+	g_hCvarPredictAdminEnabled = CreateConVar("tf_dodgeball_predict_admin", "1.0", "Enable/disable rocket prediction for admin only", FCVAR_NOTIFY | FCVAR_DONTRECORD, true, 0.0, true, 1.0);
+	g_hCvarPredictSize = CreateConVar("tf_dodgeball_predict_size", "0.5", "Thickness of rocket's predicted trail", FCVAR_NOTIFY | FCVAR_DONTRECORD, true, 0.1, true, 10.0);
+	g_hCvarPredictTimestep = CreateConVar("tf_dodgeball_predict_timestep", "0.05", "Time step for the rocket prediction loop, closer to FPS_LOGIC_INTERVAL (1/20, or 0.05 default) = better accuracy", FCVAR_NOTIFY | FCVAR_DONTRECORD, true, 0.001, true, 0.5);
+	g_hCvarPredictTime = CreateConVar("tf_dodgeball_predict_time", "1.0", "How much of the rocket's trajectory should we predict? (in seconds)", FCVAR_NOTIFY | FCVAR_DONTRECORD, true, 0.0, false);
+	
 	// Commands
 	RegConsoleCmd("sm_ab", Command_ToggleAirblast, USAGE);
+	RegConsoleCmd("sm_rocketpred", Command_TogglePrediction, "Usage: sm_rocketpred [0/1], Enable/Disable rocket prediction.");
 	RegAdminCmd("sm_tfdb", Command_DodgeballAdminMenu, ADMFLAG_GENERIC, "A menu for admins to modify things inside the plugin.");
 	
 	RegConsoleCmd("sm_currentrocket", Command_PostCurrentRocketClass, "Posts a chat message of the name of the current main rocket class.");
@@ -379,6 +397,7 @@ public void OnConfigsExecuted()
 
 public void OnMapStart()
 {
+	g_iPredictTrail = PrecacheModel("materials/sprites/laserbeam.vmt");
 	g_iClassVoters = 0;
 	g_iClassVotes = 0;
 	g_iClassVotesRequired = 0;
@@ -404,7 +423,8 @@ public Action Command_DodgeballAdminMenu(int client, int args)
 	menu.AddItem("0", "Max Rocket Count");
 	menu.AddItem("1", "Speed Multiplier");
 	menu.AddItem("2", "Main Rocket Class");
-	menu.AddItem("3", "Refresh Configurations");
+	menu.AddItem("3", "Rocket Prediction Menu");
+	menu.AddItem("4", "Refresh Configurations");
 	
 	menu.ExitButton = true;
 	menu.Display(client, MENU_TIME_FOREVER);
@@ -451,6 +471,10 @@ public int DodgeballAdmin_Handler(Menu menu, MenuAction action, int param1, int 
 					DrawRocketClassMenu(param1);
 				}
 				case 3:
+				{
+					DrawRocketPredictMenu(param1);
+				}
+				case 4:
 				{
 					// Clean up everything
 					DestroyRocketClasses();
@@ -540,6 +564,22 @@ void DrawRocketClassMenu(int client)
 		}
 		else menu.AddItem(classNumber, g_strRocketClassLongName[currentClass]);
 	}
+	
+	menu.ExitButton = true;
+	menu.Display(client, MENU_TIME_FOREVER);
+}
+
+void DrawRocketPredictMenu(int client)
+{
+	Menu menu = new Menu(DodgeballAdminRocketPredict_Handler, MENU_ACTIONS_ALL);
+	
+	menu.SetTitle("Rocket Predict Settings");
+	
+	menu.AddItem("1", "Enable/Disable Rocket Prediction (All)");
+	menu.AddItem("2", "Enable/Disable Rocket Prediction (Admins)");
+	menu.AddItem("3", "Set how Long to Predict (seconds)");
+	menu.AddItem("4", "Set Rocket Prediction Size");
+	menu.AddItem("5", "Set Rocket Prediction Timestep");
 	
 	menu.ExitButton = true;
 	menu.Display(client, MENU_TIME_FOREVER);
@@ -778,6 +818,396 @@ public int DodgeballAdminRocketClass_Handler(Menu menu, MenuAction action, int p
 			menu.GetItem(param2, sInfo, sizeof(sInfo));
 			
 			SetMainRocketClass(param2, false, param1);
+		}
+		
+		case MenuAction_Cancel:
+		{
+			PrintToServer("Client %d's menu was cancelled for reason %d", param1, param2); // Logging once again.
+		}
+		
+		case MenuAction_End:
+		{
+			delete menu;
+		}
+		
+		case MenuAction_DrawItem:
+		{
+			int style;
+			char info[32];
+			menu.GetItem(param2, info, sizeof(info), style);
+		}
+		
+		case MenuAction_DisplayItem:
+		{
+			char info[32];
+			menu.GetItem(param2, info, sizeof(info));
+		}
+	}
+}
+
+public int DodgeballAdminRocketPredict_Handler(Menu menu, MenuAction action, int param1, int param2)
+{
+	switch (action)
+	{
+		case MenuAction_Start:
+		{
+			// It's important to log anything in any way, the best is printtoserver, but if you just want to log to client to make it easier to get progress done, feel free.
+			PrintToServer("Displaying menu"); // Log it
+		}
+		
+		case MenuAction_Display:
+		{
+			PrintToServer("Client %d was sent menu with panel %x", param1, param2); // Log so you can check if it gets sent.
+		}
+		
+		case MenuAction_Select:
+		{
+			char sInfo[32];
+			menu.GetItem(param2, sInfo, sizeof(sInfo));
+			
+			switch (param2)
+			{
+				case 0:
+				{
+					if (GetConVarBool(g_hCvarPredictEnabled))
+						SetConVarBool(g_hCvarPredictEnabled, false);
+					else
+						SetConVarBool(g_hCvarPredictEnabled, true);
+				}
+				case 1:
+				{
+					if (GetConVarBool(g_hCvarPredictAdminEnabled))
+						SetConVarBool(g_hCvarPredictAdminEnabled, false);
+					else
+						SetConVarBool(g_hCvarPredictAdminEnabled, true);
+				}
+				case 2:
+				{
+					DrawRocketPredictTimeMenu(param1);
+				}
+				case 3:
+				{
+					DrawRocketPredictSizeMenu(param1);
+				}
+				case 4:
+				{
+					DrawRocketPredictTimestepMenu(param1);
+				}
+			}
+		}
+		
+		case MenuAction_Cancel:
+		{
+			PrintToServer("Client %d's menu was cancelled for reason %d", param1, param2); // Logging once again.
+		}
+		
+		case MenuAction_End:
+		{
+			delete menu;
+		}
+		
+		case MenuAction_DrawItem:
+		{
+			int style;
+			char info[32];
+			menu.GetItem(param2, info, sizeof(info), style);
+		}
+		
+		case MenuAction_DisplayItem:
+		{
+			char info[32];
+			menu.GetItem(param2, info, sizeof(info));
+		}
+	}
+}
+
+void DrawRocketPredictTimeMenu(int client)
+{
+	Menu menu = new Menu(DodgeballAdminRocketPredictTime_Handler, MENU_ACTIONS_ALL);
+	
+	menu.SetTitle("Set Predict Time, Current: %f", GetConVarFloat(g_hCvarPredictTime));
+	
+	menu.AddItem("1", "-0.5");
+	menu.AddItem("2", "Half");
+	menu.AddItem("3", "Current");
+	menu.AddItem("4", "+0.5");
+	menu.AddItem("5", "Double");
+	menu.AddItem("6", "Default");
+	
+	menu.ExitButton = true;
+	menu.Display(client, MENU_TIME_FOREVER);
+}
+
+void DrawRocketPredictSizeMenu(int client)
+{
+	Menu menu = new Menu(DodgeballAdminRocketPredictSize_Handler, MENU_ACTIONS_ALL);
+	
+	menu.SetTitle("Set Predict Size, Current: %f", GetConVarFloat(g_hCvarPredictSize));
+	
+	menu.AddItem("1", "-0.1");
+	menu.AddItem("2", "Half");
+	menu.AddItem("3", "Current");
+	menu.AddItem("4", "+0.1");
+	menu.AddItem("5", "Double");
+	menu.AddItem("6", "Default");
+	
+	menu.ExitButton = true;
+	menu.Display(client, MENU_TIME_FOREVER);
+}
+
+void DrawRocketPredictTimestepMenu(int client)
+{
+	Menu menu = new Menu(DodgeballAdminRocketPredictTimestep_Handler, MENU_ACTIONS_ALL);
+	
+	menu.SetTitle("Set Predict Timestep, Current: %f", GetConVarFloat(g_hCvarPredictTimestep));
+	
+	menu.AddItem("1", "-0.01");
+	menu.AddItem("2", "Half");
+	menu.AddItem("3", "Current");
+	menu.AddItem("4", "+0.01");
+	menu.AddItem("5", "Double");
+	menu.AddItem("6", "Default");
+	
+	menu.ExitButton = true;
+	menu.Display(client, MENU_TIME_FOREVER);
+}
+
+public int DodgeballAdminRocketPredictTime_Handler(Menu menu, MenuAction action, int param1, int param2)
+{
+	switch (action)
+	{
+		case MenuAction_Start:
+		{
+			// It's important to log anything in any way, the best is printtoserver, but if you just want to log to client to make it easier to get progress done, feel free.
+			PrintToServer("Displaying menu"); // Log it
+		}
+		
+		case MenuAction_Display:
+		{
+			PrintToServer("Client %d was sent menu with panel %x", param1, param2); // Log so you can check if it gets sent.
+		}
+		
+		case MenuAction_Select:
+		{
+			char sInfo[32];
+			menu.GetItem(param2, sInfo, sizeof(sInfo));
+			
+			float def;
+			char strdef[32];
+			GetConVarDefault(g_hCvarPredictTime, strdef, sizeof(strdef));
+			def = StringToFloat(strdef);
+			
+			float min;
+			GetConVarBounds(g_hCvarPredictTime, ConVarBound_Lower, min);
+			
+			switch (param2)
+			{
+				case 0:
+				{
+					if ((GetConVarFloat(g_hCvarPredictTime) - 0.5) >= min)
+						SetConVarFloat(g_hCvarPredictTime, GetConVarFloat(g_hCvarPredictTime) - 0.5);
+				}
+				case 1:
+				{
+					if ((GetConVarFloat(g_hCvarPredictTime) / 2.0) >= min)
+						SetConVarFloat(g_hCvarPredictTime, GetConVarFloat(g_hCvarPredictTime) / 2);
+				}
+				case 2:
+				{
+					SetConVarFloat(g_hCvarPredictTime, GetConVarFloat(g_hCvarPredictTime));
+				}
+				case 3:
+				{
+					SetConVarFloat(g_hCvarPredictTime, GetConVarFloat(g_hCvarPredictTime) + 0.5);
+				}
+				case 4:
+				{
+					SetConVarFloat(g_hCvarPredictTime, GetConVarFloat(g_hCvarPredictTime) * 2);
+				}
+				case 5:
+				{
+					SetConVarFloat(g_hCvarPredictTime, def);
+				}
+			}
+			CPrintToChat(param1, "Predict time set to: \x05%f\01.", GetConVarFloat(g_hCvarPredictTime));
+		}
+		
+		case MenuAction_Cancel:
+		{
+			PrintToServer("Client %d's menu was cancelled for reason %d", param1, param2); // Logging once again.
+		}
+		
+		case MenuAction_End:
+		{
+			delete menu;
+		}
+		
+		case MenuAction_DrawItem:
+		{
+			int style;
+			char info[32];
+			menu.GetItem(param2, info, sizeof(info), style);
+		}
+		
+		case MenuAction_DisplayItem:
+		{
+			char info[32];
+			menu.GetItem(param2, info, sizeof(info));
+		}
+	}
+}
+
+public int DodgeballAdminRocketPredictSize_Handler(Menu menu, MenuAction action, int param1, int param2)
+{
+	switch (action)
+	{
+		case MenuAction_Start:
+		{
+			// It's important to log anything in any way, the best is printtoserver, but if you just want to log to client to make it easier to get progress done, feel free.
+			PrintToServer("Displaying menu"); // Log it
+		}
+		
+		case MenuAction_Display:
+		{
+			PrintToServer("Client %d was sent menu with panel %x", param1, param2); // Log so you can check if it gets sent.
+		}
+		
+		case MenuAction_Select:
+		{
+			char sInfo[32];
+			menu.GetItem(param2, sInfo, sizeof(sInfo));
+			
+			float def;
+			char strdef[32];
+			GetConVarDefault(g_hCvarPredictSize, strdef, sizeof(strdef));
+			def = StringToFloat(strdef);
+			
+			float min;
+			float max;
+			GetConVarBounds(g_hCvarPredictSize, ConVarBound_Lower, min);
+			GetConVarBounds(g_hCvarPredictSize, ConVarBound_Upper, max);
+			
+			switch (param2)
+			{
+				case 0:
+				{
+					if (GetConVarFloat(g_hCvarPredictSize) - 0.1 >= min)
+						SetConVarFloat(g_hCvarPredictSize, GetConVarFloat(g_hCvarPredictSize) - 0.1);
+				}
+				case 1:
+				{
+					if (GetConVarFloat(g_hCvarPredictSize) / 2 >= min)
+						SetConVarFloat(g_hCvarPredictSize, GetConVarFloat(g_hCvarPredictSize) / 2);
+				}
+				case 2:
+				{
+					SetConVarFloat(g_hCvarPredictSize, GetConVarFloat(g_hCvarPredictSize));
+				}
+				case 3:
+				{
+					if (GetConVarFloat(g_hCvarPredictSize) + 0.1 <= max)
+						SetConVarFloat(g_hCvarPredictSize, GetConVarFloat(g_hCvarPredictSize) + 0.1);
+				}
+				case 4:
+				{
+					if (GetConVarFloat(g_hCvarPredictSize) * 2 <= max)
+						SetConVarFloat(g_hCvarPredictSize, GetConVarFloat(g_hCvarPredictSize) * 2);
+				}
+				case 5:
+				{
+					SetConVarFloat(g_hCvarPredictSize, def);
+				}
+			}
+			CPrintToChat(param1, "Predict size set to: \x05%f\01.", GetConVarFloat(g_hCvarPredictSize));
+		}
+		
+		case MenuAction_Cancel:
+		{
+			PrintToServer("Client %d's menu was cancelled for reason %d", param1, param2); // Logging once again.
+		}
+		
+		case MenuAction_End:
+		{
+			delete menu;
+		}
+		
+		case MenuAction_DrawItem:
+		{
+			int style;
+			char info[32];
+			menu.GetItem(param2, info, sizeof(info), style);
+		}
+		
+		case MenuAction_DisplayItem:
+		{
+			char info[32];
+			menu.GetItem(param2, info, sizeof(info));
+		}
+	}
+}
+
+public int DodgeballAdminRocketPredictTimestep_Handler(Menu menu, MenuAction action, int param1, int param2)
+{
+	switch (action)
+	{
+		case MenuAction_Start:
+		{
+			// It's important to log anything in any way, the best is printtoserver, but if you just want to log to client to make it easier to get progress done, feel free.
+			PrintToServer("Displaying menu"); // Log it
+		}
+		
+		case MenuAction_Display:
+		{
+			PrintToServer("Client %d was sent menu with panel %x", param1, param2); // Log so you can check if it gets sent.
+		}
+		
+		case MenuAction_Select:
+		{
+			char sInfo[32];
+			menu.GetItem(param2, sInfo, sizeof(sInfo));
+			
+			float min;
+			float max;
+			GetConVarBounds(g_hCvarPredictTimestep, ConVarBound_Lower, min);
+			GetConVarBounds(g_hCvarPredictTimestep, ConVarBound_Upper, max);
+			
+			float def;
+			char strdef[32];
+			GetConVarDefault(g_hCvarPredictTimestep, strdef, sizeof(strdef));
+			def = StringToFloat(strdef);
+			
+			switch (param2)
+			{
+				case 0:
+				{
+					if (GetConVarFloat(g_hCvarPredictTimestep) - 0.01 >= min)
+						SetConVarFloat(g_hCvarPredictTimestep, GetConVarFloat(g_hCvarPredictTimestep) - 0.01);
+				}
+				case 1:
+				{
+					if (GetConVarFloat(g_hCvarPredictTimestep) / 2 >= min)
+						SetConVarFloat(g_hCvarPredictTimestep, GetConVarFloat(g_hCvarPredictTimestep) / 2);
+				}
+				case 2:
+				{
+					SetConVarFloat(g_hCvarPredictTimestep, GetConVarFloat(g_hCvarPredictTimestep));
+				}
+				case 3:
+				{
+					if (GetConVarFloat(g_hCvarPredictTimestep) + 0.01 <= max)
+						SetConVarFloat(g_hCvarPredictTimestep, GetConVarFloat(g_hCvarPredictTimestep) + 0.01);
+				}
+				case 4:
+				{
+					if (GetConVarFloat(g_hCvarPredictTimestep) * 2 <= max)
+						SetConVarFloat(g_hCvarPredictTimestep, GetConVarFloat(g_hCvarPredictTimestep) * 2);
+				}
+				case 5:
+				{
+					SetConVarFloat(g_hCvarPredictTimestep, def);
+				}
+			}
+			CPrintToChat(param1, "Predict timestep set to: \x05%f\01.", GetConVarFloat(g_hCvarPredictTimestep));
 		}
 		
 		case MenuAction_Cancel:
@@ -1253,6 +1683,68 @@ public Action Command_ToggleAirblast(int clientId, int args)
 	return Plugin_Handled;
 }
 
+public Action Command_TogglePrediction(int clientId, int args)
+{
+	if (GetConVarBool(g_hCvarPredictEnabled))
+	{
+		if (GetConVarBool(g_hCvarPredictAdminEnabled))
+		{
+			if(!CheckCommandAccess(clientId, "tf_dodgeball_predict_admin_flags", ADMFLAG_GENERIC))
+			{
+				ReplyToCommand(clientId, "[SM] You do not have acess to this command.");
+				return Plugin_Continue;
+			}
+		}
+		
+		char arg[128];
+		
+		if (args > 1)
+		{
+			ReplyToCommand(clientId, "[SM] Usage: sm_rocketpred [0/1], Enable/Disable rocket prediction.");
+			return Plugin_Handled;
+		}
+		
+		if (args == 0)
+		{
+			g_bClientCanPredict[clientId] = !g_bClientCanPredict[clientId];
+		}
+		else if (args == 1)
+		{
+			GetCmdArg(1, arg, sizeof(arg));
+			
+			if (strcmp(arg, "0") == 0)
+			{
+				g_bClientCanPredict[clientId] = false;
+			}
+			else if (strcmp(arg, "1") == 0)
+			{
+				g_bClientCanPredict[clientId] = true;
+			}
+			else
+			{
+				ReplyToCommand(clientId, "[SM] Usage: sm_rocketpred [0/1], Enable/Disable rocket prediction.");
+				return Plugin_Handled;
+			}
+		}
+		
+		if (g_bClientCanPredict[clientId])
+		{
+			ReplyToCommand(clientId, "[SM] Rocket Prediction Enabled");
+		}
+		else
+		{
+			ReplyToCommand(clientId, "[SM] Rocket Prediction Disabled");
+		}
+	}
+	
+	if (!GetConVarBool(g_hCvarPredictEnabled))
+	{
+		ReplyToCommand(clientId, "[SM] Rocket Prediction is disabled for this server.");
+		g_bClientCanPredict[clientId] = false;
+	}
+	return Plugin_Handled;
+}
+
 public Action Command_PostCurrentRocketClass(int client, int args)
 {
 	if (args > 1)
@@ -1267,7 +1759,6 @@ public Action Command_PostCurrentRocketClass(int client, int args)
 		return Plugin_Handled;
 	}
 	CPrintToChatAll("Current Rocket: \x05%s\01", g_strSavedClassName);
-	
 	return Plugin_Handled;
 }
 
@@ -1406,11 +1897,35 @@ public Action OnPlayerInventory(Handle hEvent, char[] strEventName, bool bDontBr
 
 /* OnPlayerRunCmd()
 **
-** Block flamethrower's Mouse1 attack.
+** Block flamethrower's Mouse1 attack and start predicting for any players that can.
 ** -------------------------------------------------------------------------- */
 public Action OnPlayerRunCmd(int iClient, int &iButtons, int &iImpulse, float fVelocity[3], float fAngles[3], int &iWeapon)
 {
 	if (g_bEnabled == true)iButtons &= ~IN_ATTACK;
+
+	char clientname[MAX_NAME_LENGTH];
+	GetClientName(iClient, clientname, sizeof(clientname));
+
+	if (!GetConVarBool(g_hCvarPredictEnabled) || !g_bClientCanPredict[iClient])
+	{
+		return Plugin_Continue;
+	}
+	
+	char cWeapon[32];
+	GetClientWeapon(iClient, cWeapon, sizeof(cWeapon));
+	if (StrContains("", cWeapon, false) == -1)
+	{
+		if (iButtons & IN_ATTACK3)
+		{
+			g_bClientPredicting[iClient] = true;
+		}
+		else
+		{
+			g_bClientPredicting[iClient] = false;
+		}
+	}
+	ShowTrajectory();
+	
 	return Plugin_Continue;
 }
 
@@ -1554,7 +2069,7 @@ public Action Timer_StartRocketClassVote(Handle timer)
 {
 	if(!g_bVoteClassEnabled)
 		return;
-		
+	
 	g_iTimeVoted = GetTime();
 	
 	CPrintToChatAll("\x05[VRC]\01 Voting for Rocket Class \x05started\01!");
@@ -2045,6 +2560,18 @@ float CalculateRocketTurnRate(int iClass, float fModifier)
 void CalculateDirectionToClient(int iEntity, int iClient, float fOut[3])
 {
 	float fRocketPosition[3]; GetEntPropVector(iEntity, Prop_Send, "m_vecOrigin", fRocketPosition);
+	GetClientEyePosition(iClient, fOut);
+	MakeVectorFromPoints(fRocketPosition, fOut, fOut);
+	NormalizeVector(fOut, fOut);
+}
+
+/* CalculateDirectionFromPosToClient()
+**
+** As the name indicates, calculates the orientation for the rocket to move
+** towards the specified client (from the rocket's position).
+** -------------------------------------------------------------------------- */
+void CalculateDirectionFromPosToClient(float fRocketPosition[3], int iClient, float fOut[3])
+{
 	GetClientEyePosition(iClient, fOut);
 	MakeVectorFromPoints(fRocketPosition, fOut, fOut);
 	NormalizeVector(fOut, fOut);
@@ -2717,6 +3244,220 @@ Handle ParseCommands(char[] strLine)
 **
 **����������������������������������������������������������������������������������
 */
+
+public void ShowTrajectory()
+{
+	for (int client = 1; client <= MaxClients; client++)
+	{
+		if (g_bClientPredicting[client])
+		{
+			int iRocket = GetClosestRocket(NULL_VECTOR, GetClientTeam(client), client);
+			int iIndex = FindRocketByEntity(iRocket);
+			if (!IsValidRocket(iIndex))
+			{
+				return;
+			}
+			int iClass = g_iRocketClass[iIndex];
+			RocketFlags iFlags;
+			if (iRocket != EntRefToEntIndex(g_iRocketEntity[iIndex]))
+			{
+				iRocket = EntRefToEntIndex(g_iRocketEntity[iIndex]);
+				iFlags = g_iRocketFlags[iIndex];
+			}
+			int iTarget = EntRefToEntIndex(g_iRocketTarget[iIndex]);
+			int iTargetTeam = (TestFlags(iFlags, RocketFlag_IsNeutral)) ? 0 : GetClientTeam(iTarget);
+			int iDeflectionCount = GetEntProp(iRocket, Prop_Send, "m_iDeflected") - 1;
+			float fModifier = CalculateModifier(iClass, iDeflectionCount);
+			
+			// Check if the target is available
+			if (!IsValidClient(iTarget, true))
+			{
+				iTarget = SelectTarget(iTargetTeam);
+				if (!IsValidClient(iTarget, true))return;
+				g_iRocketTarget[iIndex] = EntIndexToEntRef(iTarget);
+			}
+			
+			SetTrailColor(iRocket);
+			
+			float fTurnRate = CalculateRocketTurnRate(iClass, fModifier);
+			
+			float fPosition[3], fPredPosition[3];
+			GetEntPropVector(iRocket, Prop_Data, "m_vecAbsOrigin", fPosition);
+			
+			float fDirection[3];
+			CopyVectors(g_fRocketDirection[iIndex], fDirection);
+			float fDirectionToTarget[3];
+			
+			float fVelocity[3];
+			
+			float predtime = GetConVarFloat(g_hCvarPredictTime);
+			float dt = GetConVarFloat(g_hCvarPredictTimestep);
+			float starttime = GetGameTime();
+			for (float t = 0.0; t <= predtime; t += dt)
+			{
+				if ((iDeflectionCount > g_iRocketDeflections[iIndex]))
+				{
+					// Grab new direction from the player's forward
+					CopyVectors(fDirection, g_fRocketDirection[iIndex]);
+				}
+				// If the delay time since the last reflection has been elapsed, rotate towards the client.
+				else if (((starttime + t) - g_fRocketLastDeflectionTime[iIndex]) >= g_fRocketClassControlDelay[iClass])
+				{
+					CalculateDirectionFromPosToClient(fPosition, iTarget, fDirectionToTarget);
+					// Elevate the rocket after a deflection (if it's enabled on the class definition, of course.)
+					if (iFlags & RocketFlag_Elevating)
+					{
+						if (fDirection[2] < g_fRocketClassElevationLimit[iClass])
+						{
+							fDirection[2] = FMin(fDirection[2] + g_fRocketClassElevationRate[iClass], g_fRocketClassElevationLimit[iClass]);
+							fDirectionToTarget[2] = fDirection[2];
+						}
+						else
+						{
+							iFlags &= ~RocketFlag_Elevating;
+						}
+					}
+					
+					// Smoothly change the orientation to the new one.
+					LerpVectors(fDirection, fDirectionToTarget, fDirection, fTurnRate/2);
+				}
+				
+				CopyVectors(fDirection, fVelocity);
+				ScaleVector(fVelocity, g_fRocketSpeed[iIndex]);
+				fPredPosition[0] = fPosition[0] + fVelocity[0] * dt;
+				fPredPosition[1] = fPosition[1] + fVelocity[1] * dt;
+				fPredPosition[2] = fPosition[2] + fVelocity[2] * dt;
+				
+				float mins[3] = {0.0, 0.0, 0.0}, maxs[3] = {0.0, 0.0, 0.0};
+				Handle rRayTrace = TR_TraceHullEx(fPosition, fPredPosition, mins, maxs, MASK_SHOT_HULL);
+				if (TR_GetFraction(rRayTrace) != 1.0)
+				{
+					if (TR_GetEntityIndex(rRayTrace) == iRocket && t == 0.0)
+					{
+						CloseHandle(rRayTrace);
+						fPosition = fPredPosition;
+						continue;
+					}
+					if (IsValidClient(TR_GetEntityIndex(rRayTrace)))
+					{	
+						predtime = 0.0;
+						continue;
+					}
+					
+					TR_GetEndPosition(fPredPosition, rRayTrace);
+					
+					float NVector[3];
+					TR_GetPlaneNormal(rRayTrace, NVector);
+					fVelocity = GetBounceVelocity(fVelocity, NVector);
+					fPredPosition[0] = fPosition[0] + fVelocity[0] * dt;
+					fPredPosition[1] = fPosition[1] + fVelocity[1] * dt;
+					fPredPosition[2] = fPosition[2] + fVelocity[2] * dt;
+					
+					float ZVector[3] = { 0.0, 0.0, 1.0 };
+					if(GetVectorDotProduct(NVector, ZVector) > 0.7)
+					{
+						//For objects which explode on collision:
+						//predtime = 0.0;
+					}
+				}
+				CloseHandle(rRayTrace);
+				
+				float width = GetConVarFloat(g_hCvarPredictSize);
+				TE_SetupBeamPoints(fPosition, fPredPosition, g_iPredictTrail, 0, 60, 0, 0.07, width, width, 0, 0.0, g_iPredictTrailColor, 0);
+				TE_SendToClient(client, 0.0);
+				
+				fPosition = fPredPosition;
+			}
+		}
+	}
+}
+
+public void SetTrailColor(int client)
+{
+	char classname[32];
+	GetEntityClassname(client, classname, sizeof(classname));
+	if (StrEqual(classname, "tf_projectile_rocket", false))
+	{
+		int ownerClient = GetEntPropEnt(client, Prop_Send, "m_hOwnerEntity");
+		if (!IsValidClient(ownerClient))
+		{
+			return;
+		}
+		if (GetClientTeam(ownerClient) == view_as<int>(TFTeam_Red))
+			g_iPredictTrailColor = { 255, 0, 0, 255 };
+		else if (GetClientTeam(ownerClient) == view_as<int>(TFTeam_Blue))
+			g_iPredictTrailColor = { 0, 0, 255, 255 };
+	}
+	else
+	{
+		if (GetClientTeam(client) == view_as<int>(TFTeam_Red))
+			g_iPredictTrailColor = { 255, 0, 0, 255 };
+		else if (GetClientTeam(client) == view_as<int>(TFTeam_Blue))
+			g_iPredictTrailColor = { 0, 0, 255, 255 };
+	}
+}
+
+stock int GetClosestRocket(float fPosition[3], int iTeam, int iClient = -1)
+{
+	float vPos1[3], vPos2[3];
+	if (iClient != -1)
+	{
+		char clientname[MAX_NAME_LENGTH];
+		GetClientName(iClient, clientname, sizeof(clientname));
+		GetClientEyePosition(iClient, vPos1);
+	}
+	else
+	{
+		CopyVectors(fPosition, vPos1);
+	}
+	
+	int iClosestEntity = -1;
+	float flClosestDistance = -1.0;
+	float flEntityDistance;
+
+	int iEntity = -1;
+			
+	while((iEntity = FindEntityByClassname(iEntity, "tf_projectile_rocket")) != INVALID_ENT_REFERENCE)
+	{
+		if(IsValidEntity(iEntity))
+		{
+			char classname[32];
+			GetEntityClassname(iEntity, classname, sizeof(classname));
+			if (StrEqual(classname, "tf_projectile_rocket", false))
+			{
+				int rocketTeam = GetEntProp(iEntity, Prop_Send, "m_iTeamNum");
+				if(rocketTeam != iTeam)
+				{
+					GetEntPropVector(iEntity, Prop_Send, "m_vecOrigin", vPos2);
+					flEntityDistance = GetVectorDistance(vPos1, vPos2);
+					if((flEntityDistance < flClosestDistance) || flClosestDistance == -1.0)
+					{
+						flClosestDistance = flEntityDistance;
+						iClosestEntity = iEntity;
+					}
+				}
+			}
+			else PrintToServer("GetClosestRocket: %s not a valid rocket!", classname);
+		}
+	}
+	return iClosestEntity;
+}
+
+stock float GetBounceVelocity(float vVelocity[3], float vNormal[3])
+{
+	//Accurate
+	float dotProduct = GetVectorDotProduct(vNormal, vVelocity);
+	
+	ScaleVector(vNormal, dotProduct);
+	ScaleVector(vNormal, 2.0);
+	
+	//Accurate
+	float vBounceVec[3];
+	float vCopyVelocity[3];
+	vCopyVelocity = vVelocity;
+	SubtractVectors(vCopyVelocity, vNormal, vBounceVec);
+	return vBounceVec;
+}
 
 /* ApplyDamage()
 **
