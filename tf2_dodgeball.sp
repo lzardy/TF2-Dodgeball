@@ -73,6 +73,12 @@ enum BehaviourTypes
 	Behaviour_Homing
 };
 
+enum DragTypes
+{
+	DragType_Aim, 
+	DragType_Direction
+};
+
 enum RocketFlags
 {
 	RocketFlag_None = 0, 
@@ -198,6 +204,7 @@ int g_iRocketTarget[MAX_ROCKETS];
 int g_iRocketSpawner[MAX_ROCKETS];
 int g_iRocketClass[MAX_ROCKETS];
 RocketFlags g_iRocketFlags[MAX_ROCKETS];
+DragTypes g_iRocketDragType[MAX_ROCKETS];
 float g_fRocketSpeed[MAX_ROCKETS];
 float g_fRocketDirection[MAX_ROCKETS][3];
 int g_iRocketDeflections[MAX_ROCKETS];
@@ -231,6 +238,7 @@ float g_fRocketClassElevationLimit[MAX_ROCKET_CLASSES];
 float g_fRocketClassRocketsModifier[MAX_ROCKET_CLASSES];
 float g_fRocketClassPlayerModifier[MAX_ROCKET_CLASSES];
 float g_fRocketClassControlDelay[MAX_ROCKET_CLASSES];
+DragTypes g_iRocketClassDragType[MAX_ROCKET_CLASSES];
 float g_fRocketClassTargetWeight[MAX_ROCKET_CLASSES];
 Handle g_hRocketClassCmdsOnSpawn[MAX_ROCKET_CLASSES];
 Handle g_hRocketClassCmdsOnDeflect[MAX_ROCKET_CLASSES];
@@ -1647,6 +1655,7 @@ public void CreateRocket(int iSpawnerEntity, int iSpawnerClass, int iTeam)
 		// Fetch a random rocket class and it's parameters.
 		int iClass = GetRandomRocketClass(iSpawnerClass);
 		RocketFlags iFlags = g_iRocketClassFlags[iClass];
+		DragTypes iDragType = g_iRocketClassDragType[iClass];
 		
 		// Create rocket entity.
 		int iEntity = CreateEntityByName(TestFlags(iFlags, RocketFlag_IsAnimated) ? "tf_projectile_sentryrocket" : "tf_projectile_rocket");
@@ -1673,6 +1682,7 @@ public void CreateRocket(int iSpawnerEntity, int iSpawnerClass, int iTeam)
 			float fModifier = CalculateModifier(iClass, 0);
 			g_bRocketIsValid[iIndex] = true;
 			g_iRocketFlags[iIndex] = iFlags;
+			g_iRocketDragType[iIndex] = iDragType;
 			g_iRocketEntity[iIndex] = EntIndexToEntRef(iEntity);
 			g_iRocketTarget[iIndex] = EntIndexToEntRef(iTarget);
 			g_iRocketSpawner[iIndex] = iSpawnerClass;
@@ -1884,22 +1894,45 @@ void HomingRocketThink(int iIndex)
 	// Has the rocket been deflected recently? If so, set new target.
 	else if ((iDeflectionCount > g_iRocketDeflections[iIndex]))
 	{
-		// Calculate new direction from the player's forward
 		int iClient = GetEntPropEnt(iEntity, Prop_Send, "m_hOwnerEntity");
 		if (IsValidClient(iClient))
 		{
-			float fViewAngles[3];
-			float fDirection[3];
-			GetClientEyeAngles(iClient, fViewAngles);
-			GetAngleVectors(fViewAngles, fDirection, NULL_VECTOR, NULL_VECTOR);
-			CopyVectors(fDirection, g_fRocketDirection[iIndex]);
+			if (g_iRocketDragType[iIndex] == DragType_Direction)
+			{
+				// Calculate new direction from the player's forward (puts player angles into rocket orientation)
+				float fViewAngles[3];
+				float fDirection[3];
+				GetClientEyeAngles(iClient, fViewAngles);
+				GetAngleVectors(fViewAngles, fDirection, NULL_VECTOR, NULL_VECTOR);
+				CopyVectors(fDirection, g_fRocketDirection[iIndex]);
+			}
+			else if (g_iRocketDragType[iIndex] == DragType_Aim)
+			{
+				// Calculate new direction from player's aim (rocket aims where player aims)
+				float fRocketPos[3];
+				float fRocketAng[3];
+				float fTargetPos[3];
+				GetPlayerEyePosition(iClient, fTargetPos);
+				
+				GetEntPropVector(iEntity, Prop_Data, "m_vecAbsOrigin", fRocketPos);
+				GetEntPropVector(iEntity, Prop_Data, "m_angRotation", fRocketAng);
+				
+				float tmpVec[3];
+				tmpVec[0] = fTargetPos[0] - fRocketPos[0];
+				tmpVec[1] = fTargetPos[1] - fRocketPos[1];
+				tmpVec[2] = fTargetPos[2] - fRocketPos[2];
+				GetVectorAngles(tmpVec, fRocketAng);
+				
+				float fDirection[3];
+				GetAngleVectors(fRocketAng, fDirection, NULL_VECTOR, NULL_VECTOR);
+				CopyVectors(fDirection, g_fRocketDirection[iIndex]);
+			}
 			UpdateRocketSkin(iEntity, iTeam, TestFlags(iFlags, RocketFlag_IsNeutral));
 			if (GetConVarBool(g_hCvarStealPrevention))
 			{
 				checkStolenRocket(iClient, iIndex);
 			}
 		}
-		
 		// Set new target & deflection count
 		iTarget = SelectTarget(iTargetTeam, iIndex);
 		g_iRocketTarget[iIndex] = EntIndexToEntRef(iTarget);
@@ -2579,6 +2612,9 @@ void ParseClasses(Handle kvConfig)
 		g_fRocketClassElevationRate[iIndex] = KvGetFloat(kvConfig, "elevation rate");
 		g_fRocketClassElevationLimit[iIndex] = KvGetFloat(kvConfig, "elevation limit");
 		g_fRocketClassControlDelay[iIndex] = KvGetFloat(kvConfig, "control delay");
+		KvGetString(kvConfig, "drag behaviour", strBuffer, sizeof(strBuffer), "direction");
+		if (StrEqual(strBuffer, "direction"))g_iRocketClassDragType[iIndex] = DragType_Direction;
+		else if (StrEqual(strBuffer, "aim"))g_iRocketClassDragType[iIndex] = DragType_Aim;
 		g_fRocketClassPlayerModifier[iIndex] = KvGetFloat(kvConfig, "no. players modifier");
 		g_fRocketClassRocketsModifier[iIndex] = KvGetFloat(kvConfig, "no. rockets modifier");
 		g_fRocketClassTargetWeight[iIndex] = KvGetFloat(kvConfig, "direction to target weight");
@@ -3175,6 +3211,39 @@ public bool TEF_ExcludeEntity(int entity, int contentsMask, any data)
 	return (entity != data);
 }
 
+// Used for Aim Drag Type
+public bool GetPlayerEyePosition(int client, float pos[3])
+{
+	float vAngles[3];
+	float vOrigin[3];
+	GetClientEyePosition(client, vOrigin);
+	GetClientEyeAngles(client, vAngles);
+	
+	Handle trace = TR_TraceRayFilterEx(vOrigin, vAngles, MASK_SHOT, RayType_Infinite, TraceEntityFilterPlayer, client);
+	
+	if(TR_DidHit(trace))
+	{
+		TR_GetEndPosition(pos, trace);
+		CloseHandle(trace);
+		return true;
+	}
+	CloseHandle(trace);
+	return false;
+}
+
+public bool TraceEntityFilterPlayer(int entity, int contentsMask, any data)
+{
+	if ( entity <= 0 ) return true;
+	if ( entity == data ) return false;
+	
+	char sClassname[128];
+	GetEdictClassname(entity, sClassname, sizeof(sClassname));
+	if(StrEqual(sClassname, "func_respawnroomvisualizer", false))
+		return false;
+	else
+		return true;
+}
+
 void preventAirblast(int clientId, bool prevent)
 {
 	int flags;
@@ -3202,7 +3271,6 @@ public Action TauntCheck(int victim, int &attacker, int &inflictor, float &damag
 			damage = 0.0;
 			return Plugin_Changed;
 		}
-		
 	}
 	return Plugin_Continue;
 }
@@ -3256,6 +3324,16 @@ void checkRoundDelays(int entId)
 ** -------------------------------------------------------------------------- */
 stock void SetMainRocketClass(int Index, bool isVote, int client = 0)
 {
+	char sCurrentDragType[32];
+	if (g_iRocketClassDragType[Index] == DragType_Direction)
+	{
+		sCurrentDragType = "direction";
+	}
+	else if (g_iRocketClassDragType[Index] == DragType_Aim)
+	{
+		sCurrentDragType = "aim";
+	}
+	PrintToChatAll("Current Rocket Drag Type: %s", sCurrentDragType);
 	int iSpawnerClassRed = g_iSpawnPointsRedClass[g_iCurrentRedSpawn];
 	char strBufferRed[256];
 	strcopy(strBufferRed, sizeof(strBufferRed), "Red");
