@@ -317,12 +317,12 @@ public void OnPluginStart()
 	g_hCvarPreventTauntKillEnabled = CreateConVar("tf_dodgeball_block_tauntkill", "0", "Block taunt kills?");
 	g_hCvarStealPrevention = CreateConVar("tf_dodgeball_steal_prevention", "0", "Enable steal prevention?");
 	g_hCvarStealPreventionNumber = CreateConVar("tf_dodgeball_sp_number", "3", "How many steals before you get slayed?");
-	g_hCvarVoteRocketClassCommandEnabled = CreateConVar("tf_dodgeball_voteclass", "1", "Should voting for rocket class be enabled or not?");
-	g_hCvarVoteClassPercentage = CreateConVar("tf_dodgeball_voteclass_percentage", "0.60", "Percentage of votes required to change rocket class.", FCVAR_NONE, true, 0.0, true, 1.0);
-	g_hCvarVoteClassCooldown = CreateConVar("tf_dodgeball_voteclass_cooldown", "30", "Seconds before another vote for rocket class can be initated.", FCVAR_NONE, true, 0.0);
 	g_hCvarDelayPrevention = CreateConVar("tf_dodgeball_delay_prevention", "0", "Enable delay prevention?");
 	g_hCvarDelayPreventionTime = CreateConVar("tf_dodgeball_dp_time", "5", "How much time (in seconds) before delay prevention activates?", FCVAR_NONE, true, 0.0, false);
 	g_hCvarDelayPreventionSpeedup = CreateConVar("tf_dodgeball_dp_speedup", "100", "How much speed (in hammer units per second) should the rocket gain (20 Refresh Rate for every 0.1 seconds) for delay prevention? Multiply by (15/352) for mph.", FCVAR_NONE, true, 0.0, false);
+	g_hCvarVoteRocketClassCommandEnabled = CreateConVar("tf_dodgeball_voteclass", "1", "Should voting for rocket class be enabled or not?");
+	g_hCvarVoteClassPercentage = CreateConVar("tf_dodgeball_voteclass_percentage", "0.60", "Percentage of votes required to change rocket class.", FCVAR_NONE, true, 0.0, true, 1.0);
+	g_hCvarVoteClassCooldown = CreateConVar("tf_dodgeball_voteclass_cooldown", "30", "Seconds before another vote for rocket class can be initated.", FCVAR_NONE, true, 0.0);
 	
 	// Commands
 	RegConsoleCmd("sm_ab", Command_ToggleAirblast, USAGE);
@@ -1078,7 +1078,6 @@ public Action Event_ObjectDeflected(Handle event, const char[] name, bool dontBr
 		}
 	}
 }
-
 
 //   ___					 _
 //  / __|__ _ _ __  ___ _ __| |__ _ _  _
@@ -1848,15 +1847,15 @@ int FindRocketByEntity(int iEntity)
 	int iIndex = -1;
 	while ((iIndex = FindNextValidRocket(iIndex)) != -1)
 		if (EntRefToEntIndex(g_iRocketEntity[iIndex]) == iEntity)
-		return iIndex;
+			return iIndex;
 	
 	return -1;
 }
 
-/* HomingRocketThinkg()
+/* HomingRocketThink()
 **
-** Logic process for the Behaviour_Homing type rockets, wich is simply a
-** follower rocket, picking a random target.
+** Logic process for the Behaviour_Homing type rockets, which is simply a
+** homing rocket that picks a random target.
 ** -------------------------------------------------------------------------- */
 void HomingRocketThink(int iIndex)
 {
